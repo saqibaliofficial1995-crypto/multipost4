@@ -1,0 +1,9 @@
+tokens/
+.venv/
+__pycache__/
+*.pyc
+work/
+*.mp4
+*.mov
+*.m4v
+.env
