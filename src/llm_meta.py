@@ -4,16 +4,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import re
 import json
 import time
+import random
 import requests
 
-MODEL_PRIORITY = [
+EXCLUDE_SUBSTRINGS = [
+    "-tts", "-image", "-embedding", "-aqa", "-vision", "-thinking",
+    "-live", "-native-audio", "-dialog", "-preview", "learnlm", "gemma"
+]
+
+PRIORITY_ORDER = [
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
-    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash"
+    "gemini-pro-latest"
 ]
 
 def get_live_models(api_key):
@@ -22,17 +25,34 @@ def get_live_models(api_key):
     try:
         res = requests.get(url, headers=headers, timeout=20)
         if res.status_code == 200:
-            models = [m.get("name", "").replace("models/", "") for m in res.json().get("models", [])]
-            candidates = []
-            for p in MODEL_PRIORITY:
-                for m in models:
-                    if p in m and m not in candidates:
-                        candidates.append(m)
-            if candidates:
-                return candidates
-    except Exception:
-        pass
-    return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+            models_data = res.json().get("models", [])
+            valid_models = []
+            for item in models_data:
+                methods = item.get("supportedGenerationMethods", [])
+                if "generateContent" not in methods:
+                    continue
+                name = item.get("name", "").replace("models/", "").strip()
+                name_lower = name.lower()
+                if any(sub in name_lower for sub in EXCLUDE_SUBSTRINGS):
+                    continue
+                valid_models.append(name)
+
+            ordered_models = []
+            for p in PRIORITY_ORDER:
+                for m in valid_models:
+                    if (m == p or m.startswith(p)) and m not in ordered_models:
+                        ordered_models.append(m)
+            for m in valid_models:
+                if m not in ordered_models:
+                    ordered_models.append(m)
+
+            if ordered_models:
+                print(f"[llm_meta] Filtered live models ({len(ordered_models)}): {ordered_models}", flush=True)
+                return ordered_models
+    except Exception as e:
+        print(f"[llm_meta] Warning fetching live models: {e}", flush=True)
+
+    return list(PRIORITY_ORDER)
 
 def upload_video_to_gemini(video_path, api_key):
     file_size = os.path.getsize(video_path)
@@ -46,41 +66,48 @@ def upload_video_to_gemini(video_path, api_key):
         "Content-Type": "application/json"
     }
     body = {"file": {"display_name": os.path.basename(video_path)}}
-    
-    res = requests.post(init_url, headers=headers, json=body, timeout=30)
-    res.raise_for_status()
-    upload_url = res.headers.get("X-Goog-Upload-URL") or res.headers.get("x-goog-upload-url")
 
-    # Upload video content
+    init_res = requests.post(init_url, headers=headers, json=body, timeout=30)
+    if init_res.status_code != 200:
+        raise RuntimeError(f"Gemini file upload init failed: {init_res.status_code} - {init_res.text}")
+
+    upload_url = init_res.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("No upload URL returned from Gemini.")
+
     with open(video_path, "rb") as f:
-        upload_headers = {
-            "x-goog-api-key": api_key,
-            "Content-Length": str(file_size),
-            "X-Goog-Upload-Offset": "0",
-            "X-Goog-Upload-Command": "upload, finalize"
-        }
-        up_res = requests.post(upload_url, headers=upload_headers, data=f, timeout=180)
-        up_res.raise_for_status()
-        file_info = up_res.json().get("file", {})
+        video_data = f.read()
 
+    up_headers = {
+        "Content-Length": str(file_size),
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize"
+    }
+    up_res = requests.post(upload_url, headers=up_headers, data=video_data, timeout=180)
+    if up_res.status_code != 200:
+        raise RuntimeError(f"Gemini file upload finalize failed: {up_res.status_code} - {up_res.text}")
+
+    file_info = up_res.json().get("file", {})
     file_name = file_info.get("name")
     file_uri = file_info.get("uri")
 
-    # Poll until ACTIVE
-    for _ in range(35):
-        check_url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}"
-        c_res = requests.get(check_url, headers={"x-goog-api-key": api_key}, timeout=15)
-        if c_res.status_code == 200:
-            state = c_res.json().get("state")
+    print(f"[llm_meta] Uploaded to Gemini: {file_name}. Waiting for PROCESSING state...", flush=True)
+    get_url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}"
+    for _ in range(30):
+        time.sleep(2)
+        check_res = requests.get(get_url, headers={"x-goog-api-key": api_key}, timeout=15)
+        if check_res.status_code == 200:
+            state = check_res.json().get("state")
             if state == "ACTIVE":
-                break
+                print(f"[llm_meta] Gemini file is ACTIVE.", flush=True)
+                return file_name, file_uri
             elif state == "FAILED":
-                raise RuntimeError("Gemini video processing state FAILED.")
-        time.sleep(3)
-
-    return file_name, file_uri
+                raise RuntimeError("Gemini video processing failed.")
+    raise TimeoutError("Gemini video processing timed out.")
 
 def delete_gemini_file(file_name, api_key):
+    if not file_name:
+        return
     url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}"
     try:
         requests.delete(url, headers={"x-goog-api-key": api_key}, timeout=15)
@@ -90,7 +117,7 @@ def delete_gemini_file(file_name, api_key):
 
 def clean_text(raw_text):
     text = raw_text.strip()
-    
+
     # 1. Try finding first '{' to last '}'
     match_dict = re.search(r"\{.*\}", text, re.DOTALL)
     if match_dict:
@@ -133,12 +160,12 @@ def validate_metadata(meta):
         raise ValueError(f"Title length is {len(title)} >= 60 characters.")
 
     # Currency check
-    currency_pattern = re.compile(r"[$€£¥₹]|(USD|AED|EUR|GBP)", re.IGNORECASE)
+    currency_pattern = re.compile(r"[\$€£¥₹]| (USD|AED|EUR|GBP) ", re.IGNORECASE)
     if currency_pattern.search(title):
         raise ValueError("Title contains currency symbols or currency codes.")
 
     # Magnitude/unit hallucination check
-    unit_pattern = re.compile(r"\d+\s*(m|b|k|million|billion|sqft|feet)", re.IGNORECASE)
+    unit_pattern = re.compile(r" \d+\s*(m|b|k|million|billion|sqft|feet) ", re.IGNORECASE)
     if unit_pattern.search(title):
         raise ValueError("Title contains numerical magnitude/unit pattern.")
 
@@ -193,79 +220,122 @@ Required JSON structure:
   "hashtags": ["#tag1", "#tag2", "#tag3"]
 }"""
 
-    max_attempts = 6
+    max_validation_attempts = 4
+    validation_attempts_used = 0
     final_meta = None
-    model_index = 0
+    skip_list = set()
+
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    body = {
+        "contents": [{
+            "parts": [
+                {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.4,
+            "responseMimeType": "application/json"
+        }
+    }
 
     try:
-        attempt = 1
-        while attempt <= max_attempts:
-            model = models[model_index % len(models)]
-            print(f"[retry] Attempt {attempt}/{max_attempts} with model {model}", flush=True)
+        model_idx = 0
+        consecutive_model_failures = 0
 
-            gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            headers = {
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json"
-            }
-            body = {
-                "contents": [{
-                    "parts": [
-                        {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
-                        {"text": prompt}
-                    ]
-                }],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "responseMimeType": "application/json"
-                }
-            }
+        while validation_attempts_used < max_validation_attempts:
+            candidate_models = [m for m in models if m not in skip_list]
+            if not candidate_models:
+                print("[fail] No remaining valid models in list.", flush=True)
+                break
 
-            try:
-                res = requests.post(gen_url, headers=headers, json=body, timeout=60)
-                if res.status_code == 200:
-                    cand = res.json().get("candidates", [])
-                    if cand:
-                        text_part = cand[0]["content"]["parts"][0]["text"]
-                        meta = clean_text(text_part)
-                        if meta:
-                            validate_metadata(meta)
-                            meta["path"] = "video_ai_gemini"
-                            meta["model_used"] = model
-                            final_meta = meta
-                            break
-                        else:
-                            print("[fail] Response is not a valid JSON dictionary.", flush=True)
-                            model_index += 1
-                elif res.status_code == 503:
-                    print(f"[fail] Gemini HTTP 503 (high demand) on {model}. Retrying after 4s backoff...", flush=True)
-                    time.sleep(4)
-                    # Try same model once more
-                    res_retry = requests.post(gen_url, headers=headers, json=body, timeout=60)
-                    if res_retry.status_code == 200:
-                        cand = res_retry.json().get("candidates", [])
-                        if cand:
-                            text_part = cand[0]["content"]["parts"][0]["text"]
-                            meta = clean_text(text_part)
-                            if meta:
-                                validate_metadata(meta)
-                                meta["path"] = "video_ai_gemini"
-                                meta["model_used"] = model
-                                final_meta = meta
-                                break
-                    model_index += 1
+            current_model = candidate_models[model_idx % len(candidate_models)]
+            gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent?key={api_key}"
+
+            print(f"[model] Trying model '{current_model}' (validation attempts: {validation_attempts_used}/{max_validation_attempts})...", flush=True)
+
+            res = None
+            transient_retries = 3
+            backoff_schedule = [5, 15, 30]
+
+            for retry_i in range(transient_retries + 1):
+                try:
+                    res = requests.post(gen_url, headers=headers, json=body, timeout=60)
+                except Exception as req_err:
+                    print(f"[warning] Request error on {current_model}: {req_err}", flush=True)
+                    res = None
+
+                status_code = res.status_code if res is not None else 500
+
+                # 1. TRANSIENT: 503, 429, 500 -> retry same model without burning validation budget
+                if status_code in (503, 429, 500):
+                    if retry_i < transient_retries:
+                        backoff = backoff_schedule[retry_i] + random.uniform(0.5, 2.0)
+                        print(f"[transient] HTTP {status_code} on {current_model}. Transient retry {retry_i+1}/{transient_retries} after {backoff:.1f}s backoff...", flush=True)
+                        time.sleep(backoff)
+                        continue
+                    else:
+                        print(f"[transient] HTTP {status_code} persisted on {current_model} after {transient_retries} retries. Switching model without consuming validation budget.", flush=True)
+                        break
+
+                # 2. MODEL KHARAB: 404, 400 -> permanently skip model without burning validation budget
+                elif status_code in (404, 400):
+                    err_msg = res.text[:120] if res is not None else ""
+                    print(f"[bad_model] HTTP {status_code} on {current_model}: {err_msg}. Permanently skipping model without consuming validation budget.", flush=True)
+                    skip_list.add(current_model)
+                    break
+
+                # 3. SUCCESS / OTHER
                 else:
-                    print(f"[fail] Gemini HTTP {res.status_code}: {res.text[:120]}", flush=True)
-                    model_index += 1
-            except Exception as e:
-                print(f"[fail] Validation failed: {e}", flush=True)
-                model_index += 1
+                    break
 
-            attempt += 1
-            time.sleep(2)
+            if res is None or res.status_code != 200:
+                consecutive_model_failures += 1
+                if consecutive_model_failures >= len(candidate_models) * 2:
+                    print("[fail] All models gave transient or fatal errors.", flush=True)
+                    break
+                model_idx += 1
+                continue
+
+            consecutive_model_failures = 0
+
+            # HTTP 200: Parse & Validate
+            try:
+                candidates = res.json().get("candidates", [])
+                if not candidates:
+                    print(f"[fail] No candidates in response from {current_model}.", flush=True)
+                    validation_attempts_used += 1
+                    model_idx += 1
+                    continue
+
+                text_part = candidates[0]["content"]["parts"][0]["text"]
+                meta = clean_text(text_part)
+                if not meta:
+                    print(f"[fail] Could not parse JSON from model response ({current_model}).", flush=True)
+                    validation_attempts_used += 1
+                    model_idx += 1
+                    continue
+
+                validate_metadata(meta)
+                # Validation passed
+                meta["path"] = "video_ai_gemini"
+                meta["model_used"] = current_model
+                final_meta = meta
+                break
+
+            except Exception as val_err:
+                print(f"[fail] Validation error on {current_model}: {val_err}", flush=True)
+                validation_attempts_used += 1
+                model_idx += 1
+                time.sleep(2)
 
         if not final_meta:
-            raise RuntimeError(f"Failed to generate validated video metadata after {max_attempts} attempts.")
+            raise RuntimeError(
+                f"Failed to generate validated video metadata: all models failed or validation budget ({max_validation_attempts}) exhausted."
+            )
 
         topic = final_meta.get("inferred_topic", "General Entertainment")
         title = final_meta.get("title", "")
