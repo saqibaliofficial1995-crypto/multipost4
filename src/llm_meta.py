@@ -1,4 +1,6 @@
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import re
 import json
 import time
@@ -7,26 +9,29 @@ import requests
 MODEL_PRIORITY = [
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-1.5-flash",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash"
 ]
 
 def get_live_models(api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     headers = {"x-goog-api-key": api_key}
-    res = requests.get(url, headers=headers, timeout=20)
-    if res.status_code == 200:
-        models = [m.get("name", "").replace("models/", "") for m in res.json().get("models", [])]
-        candidates = []
-        for p in MODEL_PRIORITY:
-            for m in models:
-                if p in m and m not in candidates:
-                    candidates.append(m)
-        if candidates:
-            return candidates
+    try:
+        res = requests.get(url, headers=headers, timeout=20)
+        if res.status_code == 200:
+            models = [m.get("name", "").replace("models/", "") for m in res.json().get("models", [])]
+            candidates = []
+            for p in MODEL_PRIORITY:
+                for m in models:
+                    if p in m and m not in candidates:
+                        candidates.append(m)
+            if candidates:
+                return candidates
+    except Exception:
+        pass
     return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 def upload_video_to_gemini(video_path, api_key):
@@ -44,11 +49,9 @@ def upload_video_to_gemini(video_path, api_key):
     
     res = requests.post(init_url, headers=headers, json=body, timeout=30)
     res.raise_for_status()
-    upload_url = res.headers.get("X-Goog-Upload-URL")
-    if not upload_url:
-        upload_url = res.headers.get("x-goog-upload-url")
+    upload_url = res.headers.get("X-Goog-Upload-URL") or res.headers.get("x-goog-upload-url")
 
-    # Upload bytes
+    # Upload video content
     with open(video_path, "rb") as f:
         upload_headers = {
             "x-goog-api-key": api_key,
@@ -64,7 +67,7 @@ def upload_video_to_gemini(video_path, api_key):
     file_uri = file_info.get("uri")
 
     # Poll until ACTIVE
-    for _ in range(30):
+    for _ in range(35):
         check_url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}"
         c_res = requests.get(check_url, headers={"x-goog-api-key": api_key}, timeout=15)
         if c_res.status_code == 200:
@@ -72,56 +75,74 @@ def upload_video_to_gemini(video_path, api_key):
             if state == "ACTIVE":
                 break
             elif state == "FAILED":
-                raise RuntimeError("Gemini video processing failed.")
-        time.sleep(4)
+                raise RuntimeError("Gemini video processing state FAILED.")
+        time.sleep(3)
 
     return file_name, file_uri
 
 def delete_gemini_file(file_name, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}"
-    requests.delete(url, headers={"x-goog-api-key": api_key}, timeout=15)
-    print(f"[llm_meta] Deleted Gemini temporary file {file_name}.", flush=True)
+    try:
+        requests.delete(url, headers={"x-goog-api-key": api_key}, timeout=15)
+        print(f"[llm_meta] Deleted Gemini temporary file {file_name}.", flush=True)
+    except Exception as e:
+        print(f"[llm_meta] Warning deleting Gemini file: {e}", flush=True)
 
 def clean_text(raw_text):
     text = raw_text.strip()
-    # Strip markdown code blocks
+    
+    # 1. Try finding first '{' to last '}'
+    match_dict = re.search(r"\{.*\}", text, re.DOTALL)
+    if match_dict:
+        try:
+            return json.loads(match_dict.group(0))
+        except Exception:
+            pass
+
+    # 2. Try finding array '[' to ']'
+    match_arr = re.search(r"\[.*\]", text, re.DOTALL)
+    if match_arr:
+        try:
+            arr = json.loads(match_arr.group(0))
+            if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
+                return arr[0]
+        except Exception:
+            pass
+
+    # Fallback cleanup
     text = re.sub(r"^```(?:json|text)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
-    text = text.strip()
-
-    # If it is JSON, parse and unpack
     try:
         data = json.loads(text)
         if isinstance(data, list) and len(data) > 0:
-            data = data[0]
+            return data[0]
         return data
     except Exception:
         pass
 
-    # Strip prefixes like text:, description:, json:
-    text = re.sub(r"^(?:text|description|json):\s*", "", text, flags=re.IGNORECASE)
-    return text.strip()
+    return None
 
 def validate_metadata(meta):
+    if not isinstance(meta, dict):
+        raise ValueError("Metadata is not a valid dictionary.")
+
     title = meta.get("title", "").strip()
-    
-    # 1. Title length < 60
-    if len(title) >= 60:
-        raise ValueError(f"Title length is {len(title)} >= 60 characters.")
     if not title:
         raise ValueError("Title is empty.")
+    if len(title) >= 60:
+        raise ValueError(f"Title length is {len(title)} >= 60 characters.")
 
-    # 2. Currency hallucination check
+    # Currency check
     currency_pattern = re.compile(r"[$€£¥₹]|(USD|AED|EUR|GBP)", re.IGNORECASE)
     if currency_pattern.search(title):
         raise ValueError("Title contains currency symbols or currency codes.")
 
-    # 3. Number+unit hallucination pattern (e.g. 10m, 500k, 2 billion, 500 sqft, 100 feet)
+    # Magnitude/unit hallucination check
     unit_pattern = re.compile(r"\d+\s*(m|b|k|million|billion|sqft|feet)", re.IGNORECASE)
     if unit_pattern.search(title):
-        raise ValueError("Title contains numerical magnitude/unit hallucination.")
+        raise ValueError("Title contains numerical magnitude/unit pattern.")
 
-    # 4. Tags contract: 10-15 tags, total comma length < 460
+    # Tags check: 10-15 tags, total joined length < 460
     tags = meta.get("tags", [])
     if not isinstance(tags, list) or len(tags) < 10:
         raise ValueError(f"Tags count is {len(tags)}, must be at least 10.")
@@ -131,7 +152,7 @@ def validate_metadata(meta):
     if len(tags_joined) >= 460:
         raise ValueError(f"Tags string length {len(tags_joined)} exceeds 460 characters.")
 
-    # 5. Exactly 3 hashtags
+    # Hashtags check: exactly 3
     hashtags = meta.get("hashtags", [])
     if not isinstance(hashtags, list) or len(hashtags) != 3:
         raise ValueError(f"Hashtags count is {len(hashtags)}, must be exactly 3.")
@@ -150,16 +171,18 @@ def generate_video_metadata(video_path, api_key, duration_seconds=60):
     file_name, file_uri = upload_video_to_gemini(video_path, api_key)
 
     prompt = """Watch the video frames and listen to the audio carefully. Do NOT use the video filename to guess content.
+Return ONLY a raw JSON object. No markdown, no code fences, no explanation text before or after.
+
 Perform this exact analysis:
 1. Inferred channel topic/niche from the actual video visuals.
 2. The language of the video (e.g. 'en', 'es', 'ur', etc.).
 3. Relevant YouTube category ID (e.g. '22' for People & Blogs, '24' for Entertainment, '26' for Howto).
-4. Engaging SEO Title: Must be under 60 characters with the primary keyword right at the very beginning. NEVER include money amounts, currency signs ($ € £ etc.), or fake stats.
+4. Engaging SEO Title: Under 60 characters with the primary keyword right at the beginning. NEVER include money amounts, currency signs ($ € £ etc.), or fake statistics.
 5. Description: First 2 lines must be an intriguing hook, followed by a brief summary.
 6. 10 to 15 relevant SEO tags (comma joined length under 460 chars).
 7. Exactly 3 relevant hashtags (include #shorts if duration is <= 60 seconds).
 
-Return strictly JSON format:
+Required JSON structure:
 {
   "inferred_topic": "topic summary",
   "language": "en",
@@ -170,13 +193,15 @@ Return strictly JSON format:
   "hashtags": ["#tag1", "#tag2", "#tag3"]
 }"""
 
-    max_attempts = 4
+    max_attempts = 6
     final_meta = None
+    model_index = 0
 
     try:
-        for attempt in range(max_attempts):
-            model = models[attempt % len(models)]
-            print(f"[retry] Attempt {attempt+1}/{max_attempts} with model {model}", flush=True)
+        attempt = 1
+        while attempt <= max_attempts:
+            model = models[model_index % len(models)]
+            print(f"[retry] Attempt {attempt}/{max_attempts} with model {model}", flush=True)
 
             gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
             headers = {
@@ -203,7 +228,7 @@ Return strictly JSON format:
                     if cand:
                         text_part = cand[0]["content"]["parts"][0]["text"]
                         meta = clean_text(text_part)
-                        if isinstance(meta, dict):
+                        if meta:
                             validate_metadata(meta)
                             meta["path"] = "video_ai_gemini"
                             meta["model_used"] = model
@@ -211,16 +236,37 @@ Return strictly JSON format:
                             break
                         else:
                             print("[fail] Response is not a valid JSON dictionary.", flush=True)
+                            model_index += 1
+                elif res.status_code == 503:
+                    print(f"[fail] Gemini HTTP 503 (high demand) on {model}. Retrying after 4s backoff...", flush=True)
+                    time.sleep(4)
+                    # Try same model once more
+                    res_retry = requests.post(gen_url, headers=headers, json=body, timeout=60)
+                    if res_retry.status_code == 200:
+                        cand = res_retry.json().get("candidates", [])
+                        if cand:
+                            text_part = cand[0]["content"]["parts"][0]["text"]
+                            meta = clean_text(text_part)
+                            if meta:
+                                validate_metadata(meta)
+                                meta["path"] = "video_ai_gemini"
+                                meta["model_used"] = model
+                                final_meta = meta
+                                break
+                    model_index += 1
                 else:
                     print(f"[fail] Gemini HTTP {res.status_code}: {res.text[:120]}", flush=True)
+                    model_index += 1
             except Exception as e:
                 print(f"[fail] Validation failed: {e}", flush=True)
+                model_index += 1
+
+            attempt += 1
             time.sleep(2)
 
         if not final_meta:
-            raise RuntimeError("Failed to generate validated video metadata after 4 attempts.")
+            raise RuntimeError(f"Failed to generate validated video metadata after {max_attempts} attempts.")
 
-        # Log according to exact spec
         topic = final_meta.get("inferred_topic", "General Entertainment")
         title = final_meta.get("title", "")
         desc = final_meta.get("description", "")
