@@ -42,13 +42,12 @@ def get_live_models(api_key):
                 for m in valid_models:
                     if (m == p or m.startswith(p)) and m not in ordered_models:
                         ordered_models.append(m)
-            for m in valid_models:
-                if m not in ordered_models:
-                    ordered_models.append(m)
 
             if ordered_models:
                 print(f"[llm_meta] Filtered live models ({len(ordered_models)}): {ordered_models}", flush=True)
                 return ordered_models
+            else:
+                raise RuntimeError(f"None of the priority models ({PRIORITY_ORDER}) found in live Gemini API model list.")
     except Exception as e:
         print(f"[llm_meta] Warning fetching live models: {e}", flush=True)
 
@@ -115,37 +114,59 @@ def delete_gemini_file(file_name, api_key):
     except Exception as e:
         print(f"[llm_meta] Warning deleting Gemini file: {e}", flush=True)
 
+def sanitize_json_controls(raw_json_str):
+    def fix_str(match):
+        val = match.group(0)
+        val = re.sub(r'(?<!\\)\n', r'\\n', val)
+        val = re.sub(r'(?<!\\)\r', r'\\r', val)
+        val = re.sub(r'(?<!\\)\t', r'\\t', val)
+        return val
+    try:
+        return re.sub(r'"(?:[^"\\]|\\.)*"', fix_str, raw_json_str, flags=re.DOTALL)
+    except Exception:
+        return raw_json_str
+
+def try_parse_json(s):
+    if not s:
+        return None
+    # 1. Direct parse with strict=False
+    try:
+        return json.loads(s, strict=False)
+    except Exception:
+        pass
+    # 2. Backup sanitizer: escape unescaped control characters
+    try:
+        sanitized = sanitize_json_controls(s)
+        return json.loads(sanitized, strict=False)
+    except Exception:
+        pass
+    return None
+
 def clean_text(raw_text):
     text = raw_text.strip()
 
     # 1. Try finding first '{' to last '}'
     match_dict = re.search(r"\{.*\}", text, re.DOTALL)
     if match_dict:
-        try:
-            return json.loads(match_dict.group(0))
-        except Exception:
-            pass
+        res = try_parse_json(match_dict.group(0))
+        if isinstance(res, dict):
+            return res
 
     # 2. Try finding array '[' to ']'
     match_arr = re.search(r"\[.*\]", text, re.DOTALL)
     if match_arr:
-        try:
-            arr = json.loads(match_arr.group(0))
-            if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
-                return arr[0]
-        except Exception:
-            pass
+        res = try_parse_json(match_arr.group(0))
+        if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
+            return res[0]
 
-    # Fallback cleanup
-    text = re.sub(r"^```(?:json|text)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        data = json.loads(text)
-        if isinstance(data, list) and len(data) > 0:
-            return data[0]
-        return data
-    except Exception:
-        pass
+    # 3. Fallback cleanup: strip markdown code blocks
+    cleaned = re.sub(r"^```(?:json|text)?\s*", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    res = try_parse_json(cleaned)
+    if isinstance(res, dict):
+        return res
+    elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
+        return res[0]
 
     return None
 
@@ -225,6 +246,9 @@ Required JSON structure:
     final_meta = None
     skip_list = set()
 
+    start_meta_time = time.time()
+    MAX_METADATA_TIME_SECONDS = 360  # 6-minute overall time cap
+
     headers = {
         "x-goog-api-key": api_key,
         "Content-Type": "application/json"
@@ -247,6 +271,12 @@ Required JSON structure:
         consecutive_model_failures = 0
 
         while validation_attempts_used < max_validation_attempts:
+            # Check 6-minute overall time cap
+            elapsed_total = time.time() - start_meta_time
+            if elapsed_total > MAX_METADATA_TIME_SECONDS:
+                print(f"[time_cap] Overall time cap of {MAX_METADATA_TIME_SECONDS}s exceeded ({elapsed_total:.1f}s elapsed). Aborting.", flush=True)
+                break
+
             candidate_models = [m for m in models if m not in skip_list]
             if not candidate_models:
                 print("[fail] No remaining valid models in list.", flush=True)
@@ -255,13 +285,18 @@ Required JSON structure:
             current_model = candidate_models[model_idx % len(candidate_models)]
             gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent?key={api_key}"
 
-            print(f"[model] Trying model '{current_model}' (validation attempts: {validation_attempts_used}/{max_validation_attempts})...", flush=True)
+            print(f"[model] Trying model '{current_model}' (validation attempts: {validation_attempts_used}/{max_validation_attempts}, elapsed: {elapsed_total:.1f}s)...", flush=True)
 
             res = None
             transient_retries = 3
-            backoff_schedule = [5, 15, 30]
+            backoff_schedule = [4, 8, 16]
 
             for retry_i in range(transient_retries + 1):
+                # Check time cap before each request
+                if (time.time() - start_meta_time) > MAX_METADATA_TIME_SECONDS:
+                    print(f"[time_cap] Overall time cap exceeded during retries.", flush=True)
+                    break
+
                 try:
                     res = requests.post(gen_url, headers=headers, json=body, timeout=60)
                 except Exception as req_err:
@@ -273,7 +308,7 @@ Required JSON structure:
                 # 1. TRANSIENT: 503, 429, 500 -> retry same model without burning validation budget
                 if status_code in (503, 429, 500):
                     if retry_i < transient_retries:
-                        backoff = backoff_schedule[retry_i] + random.uniform(0.5, 2.0)
+                        backoff = backoff_schedule[retry_i] + random.uniform(0.5, 1.5)
                         print(f"[transient] HTTP {status_code} on {current_model}. Transient retry {retry_i+1}/{transient_retries} after {backoff:.1f}s backoff...", flush=True)
                         time.sleep(backoff)
                         continue
@@ -314,13 +349,14 @@ Required JSON structure:
                 text_part = candidates[0]["content"]["parts"][0]["text"]
                 meta = clean_text(text_part)
                 if not meta:
-                    print(f"[fail] Could not parse JSON from model response ({current_model}).", flush=True)
+                    sample = text_part[:150].replace("\n", " ") if text_part else "empty"
+                    print(f"[fail] Could not parse JSON from model response ({current_model}). Sample: {sample!r}", flush=True)
                     validation_attempts_used += 1
                     model_idx += 1
                     continue
 
                 validate_metadata(meta)
-                # Validation passed
+                # Validation passed!
                 meta["path"] = "video_ai_gemini"
                 meta["model_used"] = current_model
                 final_meta = meta
@@ -333,8 +369,9 @@ Required JSON structure:
                 time.sleep(2)
 
         if not final_meta:
+            elapsed_final = time.time() - start_meta_time
             raise RuntimeError(
-                f"Failed to generate validated video metadata: all models failed or validation budget ({max_validation_attempts}) exhausted."
+                f"Failed to generate validated video metadata: models unavailable or validation/time budget ({elapsed_final:.1f}s) exhausted."
             )
 
         topic = final_meta.get("inferred_topic", "General Entertainment")
