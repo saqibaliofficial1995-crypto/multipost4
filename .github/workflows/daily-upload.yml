@@ -1,0 +1,66 @@
+name: Daily Upload
+
+on:
+  schedule:
+    - cron: "15 2,8,14 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run in dry-run mode (no actual YouTube upload or Drive move)"
+        required: false
+        default: "false"
+      max_uploads:
+        description: "Max number of videos to upload"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: multipost4-upload
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Runner public IP
+        run: |
+          echo "Runner public IP: $(curl -s https://api.ipify.org)"
+
+      - name: Run Pipeline
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          MAX_UPLOADS: ${{ github.event.inputs.max_uploads || '1' }}
+        run: python -u src/ci_run.py --config config.ci.yaml
+
+      - name: Commit state changes
+        if: always()
+        run: |
+          git config user.name "alamhaiderazaz-commits"
+          git config user.email "alamhaiderazaz@gmail.com"
+          git add state/
+          git diff --staged --quiet || (git commit -m "chore: update upload state [skip ci]" && git push)

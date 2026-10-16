@@ -2,6 +2,7 @@ import os
 import json
 import yaml
 import datetime
+import argparse
 import requests
 
 from src.auth_env import get_access_token, get_gemini_api_key, get_drive_folder_id
@@ -53,6 +54,9 @@ def execute_pipeline(config_path="config.ci.yaml"):
     print("[start] Channel 4 Multipost Run starting...", flush=True)
     config = load_config(config_path)
     
+    is_dry_run = os.environ.get("DRY_RUN", "false").lower() in ["true", "1", "yes"]
+    env_max = os.environ.get("MAX_UPLOADS")
+    
     state_file = os.path.join(config.get("paths", {}).get("state", "state"), "uploaded.json")
     state = load_state(state_file)
     uploaded_ids = get_uploaded_ids(state)
@@ -75,7 +79,7 @@ def execute_pipeline(config_path="config.ci.yaml"):
     work_dir = config.get("paths", {}).get("work", "work")
     os.makedirs(work_dir, exist_ok=True)
 
-    max_videos = config.get("schedule", {}).get("max_videos_per_run", 1)
+    max_videos = int(env_max) if env_max and env_max.isdigit() else config.get("schedule", {}).get("max_videos_per_run", 1)
     processed_count = 0
 
     for video_info in pending_videos[:max_videos]:
@@ -96,6 +100,11 @@ def execute_pipeline(config_path="config.ci.yaml"):
 
             # 3. Gemini Multimodal Analysis
             metadata = generate_video_metadata(norm_path, gemini_key, duration_seconds=duration)
+
+            if is_dry_run:
+                print(f"[dry-run] Dry run active. Validated metadata path: '{metadata.get('path')}'. Skipping YouTube upload and Drive move for {file_name}.", flush=True)
+                processed_count += 1
+                continue
 
             # 4. Upload to YouTube (with safety gate check)
             yt_id, yt_url = upload_to_youtube(norm_path, metadata, access_token, config)
@@ -128,3 +137,9 @@ def execute_pipeline(config_path="config.ci.yaml"):
                         pass
 
     print(f"[finish] Processed {processed_count} video(s).", flush=True)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.ci.yaml", help="Path to config file")
+    args = parser.parse_args()
+    execute_pipeline(args.config)

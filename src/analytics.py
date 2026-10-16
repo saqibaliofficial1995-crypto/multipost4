@@ -48,3 +48,8 @@ def run_weekly_analytics(access_token):
         f.write(report_content)
 
     print(f"[analytics] Weekly report generated successfully at {report_file}", flush=True)
+
+if __name__ == "__main__":
+    from src.auth_env import get_access_token
+    token = get_access_token()
+    run_weekly_analytics(token)

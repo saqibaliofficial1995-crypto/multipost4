@@ -88,3 +88,9 @@ def run_comment_responder(access_token, gemini_api_key, max_replies=5):
 
     save_replied_ids(replied_ids)
     print(f"[comments] Completed comment run. Replied to {replied_count} new comment(s).", flush=True)
+
+if __name__ == "__main__":
+    from src.auth_env import get_access_token, get_gemini_api_key
+    token = get_access_token()
+    gemini_key = get_gemini_api_key()
+    run_comment_responder(token, gemini_key)
