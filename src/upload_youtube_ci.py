@@ -37,25 +37,48 @@ def upload_to_youtube(video_path, metadata, access_token, config):
         "X-Upload-Content-Length": str(os.path.getsize(video_path))
     }
 
-    res = requests.post(init_url, headers=headers, json=body, timeout=30)
-    res.raise_for_status()
-    upload_url = res.headers.get("Location")
-    if not upload_url:
-        raise RuntimeError("No upload Location header returned by YouTube API.")
+    uploads_playlist_id = "UUZondNewuq0gMQIxEaZOk2g"
 
-    # Upload video content
-    with open(video_path, "rb") as f:
-        up_headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "video/mp4"
-        }
-        up_res = requests.put(upload_url, headers=up_headers, data=f, timeout=300)
-        up_res.raise_for_status()
-        yt_data = up_res.json()
+    try:
+        res = requests.post(init_url, headers=headers, json=body, timeout=30)
+        res.raise_for_status()
+        upload_url = res.headers.get("Location")
+        if not upload_url:
+            raise RuntimeError("No upload Location header returned by YouTube API.")
 
-    video_id = yt_data.get("id")
-    if not video_id:
-        raise RuntimeError("No video ID in YouTube response.")
+        # Upload video content
+        with open(video_path, "rb") as f:
+            up_headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "video/mp4"
+            }
+            up_res = requests.put(upload_url, headers=up_headers, data=f, timeout=300)
+            up_res.raise_for_status()
+            yt_data = up_res.json()
+
+        video_id = yt_data.get("id")
+        if not video_id:
+            raise RuntimeError("No video ID in YouTube response.")
+
+    except Exception as e:
+        err_text = str(e)
+        status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+        if status_code == 409 or "alreadyExists" in err_text or "409" in err_text:
+            print(f"[yt] 409 / alreadyExists detected: {err_text}. Searching uploads playlist {uploads_playlist_id}...", flush=True)
+            pl_url = f"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId={uploads_playlist_id}&maxResults=50"
+            pl_res = requests.get(pl_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
+            if pl_res.status_code == 200:
+                items = pl_res.json().get("items", [])
+                for item in items:
+                    snip = item.get("snippet", {})
+                    it_title = snip.get("title", "").strip()
+                    if it_title == title or it_title.lower() == title.lower() or title.lower() in it_title.lower():
+                        matched_id = snip.get("resourceId", {}).get("videoId")
+                        if matched_id:
+                            print(f"[yt] Matched existing video ID: {matched_id}", flush=True)
+                            return matched_id, f"https://youtu.be/{matched_id}"
+            print("[yt] Could not match existing video in playlist.", flush=True)
+        raise
 
     # Verify upload and privacy status
     verify_url = f"https://www.googleapis.com/youtube/v3/videos?part=status,snippet&id={video_id}"

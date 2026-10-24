@@ -374,7 +374,10 @@ Required JSON structure:
                 f"Failed to generate validated video metadata: models unavailable or validation/time budget ({elapsed_final:.1f}s) exhausted."
             )
 
-        topic = final_meta.get("inferred_topic", "General Entertainment")
+        topic = final_meta.get("inferred_topic")
+        if not topic:
+            print("[meta] topic fallback used", flush=True)
+            topic = "General Entertainment" 
         title = final_meta.get("title", "")
         desc = final_meta.get("description", "")
         hook = "\n".join([line for line in desc.splitlines() if line.strip()][:2])

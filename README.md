@@ -12,8 +12,8 @@ Fully automated, cloud-native YouTube channel automation pipeline for **Jennifer
 | **YouTube Channel ID** | `UCZondNewuq0gMQIxEaZOk2g` |
 | **Google Cloud Project** | `yt-multipost-channel4` |
 | **Primary Account** | `alamhaiderazaz@gmail.com` |
-| **GitHub Repo** | `alamhaiderazaz-commits/multipost4` (Private) |
-| **GitHub Pages** | `https://alamhaiderazaz-commits.github.io/` |
+| **GitHub Repo** | `saqibaliofficial1995-crypto/multipost4` (Private) |
+| **GitHub Pages** | `https://saqibaliofficial1995-crypto.github.io/` |
 | **Google Drive Inbox ID** | `1yauKXcSpZ72rUPGIGO5bRqck7GI3scuA` |
 | **Google Drive Uploaded ID**| `11w1DI_UD7WzNZ-6egFXoVlV5gfSkPs-I` |
 
