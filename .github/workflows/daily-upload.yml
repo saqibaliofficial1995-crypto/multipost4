@@ -18,7 +18,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: multipost4-upload
+  group: multipost4-pipeline
   cancel-in-progress: false
 
 jobs:
