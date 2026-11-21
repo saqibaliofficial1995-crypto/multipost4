@@ -11,6 +11,12 @@ def upload_to_youtube(video_path, metadata, access_token, config):
         raise RuntimeError(f"Safety block triggered: metadata path '{meta_path}' not authorized.")
 
     title = metadata["title"]
+    # Append #Shorts to title for algorithmic shelf indexing
+    if "#shorts" not in title.lower():
+        if len(title) + len(" #Shorts") <= 70:
+            title = f"{title} #Shorts"
+        else:
+            title = title[:60].rsplit(" ", 1)[0] + " #Shorts"
     desc = metadata["description"]
     if config.get("metadata", {}).get("append_hashtags_to_description", True):
         desc = f"{desc}\n\n" + " ".join(metadata.get("hashtags", []))

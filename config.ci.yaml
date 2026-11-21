@@ -15,7 +15,7 @@ platforms:
 youtube:
   privacy_status: "public"
   made_for_kids: false
-  category_id: "22"
+  category_id: "24"
   default_tags:
     - shorts
     - viral
