@@ -177,8 +177,12 @@ def validate_metadata(meta):
     title = meta.get("title", "").strip()
     if not title:
         raise ValueError("Title is empty.")
-    if len(title) >= 60:
-        raise ValueError(f"Title length is {len(title)} >= 60 characters.")
+    if len(title) > 70:
+        if " " in title[:70]:
+            title = title[:70].rsplit(" ", 1)[0].strip()
+        else:
+            title = title[:70]
+    meta["title"] = title
 
     # Currency check
     currency_pattern = re.compile(r"[\$€£¥₹]| (USD|AED|EUR|GBP) ", re.IGNORECASE)
